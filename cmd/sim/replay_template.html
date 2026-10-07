@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>乐观锁并发更新回放</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #1a2129; --border: #2c3644;
+    --text: #d7dde5; --dim: #8a97a5;
+    --c-read: #4a90d9; --c-attempt: #e0b341; --c-conflict: #d9534f;
+    --c-backoff: #5c6b7a; --c-yield: #9b59b6; --c-commit: #2ecc71; --c-giveup: #111;
+    --c-livelock: #ff2d55;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 -apple-system, "PingFang SC", "Helvetica Neue", monospace, sans-serif; }
+  header { padding: 16px 20px 8px; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: var(--dim); font-size: 12px; }
+  #stats { display: flex; flex-wrap: wrap; gap: 10px; padding: 10px 20px; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 6px;
+          padding: 6px 12px; font-size: 12px; }
+  .stat b { display: block; font-size: 16px; }
+  #controls { display: flex; align-items: center; gap: 12px; padding: 8px 20px; }
+  button { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+           border-radius: 6px; padding: 6px 14px; cursor: pointer; font-size: 13px; }
+  button:hover { border-color: var(--dim); }
+  select { background: var(--panel); color: var(--text); border: 1px solid var(--border);
+           border-radius: 6px; padding: 5px 8px; }
+  #scrub { flex: 1; accent-color: var(--c-read); }
+  #clock { font-variant-numeric: tabular-nums; min-width: 90px; text-align: right; }
+  #banner { display: none; margin: 0 20px 8px; padding: 8px 12px; border-radius: 6px;
+            background: rgba(255,45,85,.15); border: 1px solid var(--c-livelock);
+            color: var(--c-livelock); font-weight: 600; }
+  #banner.on { display: block; }
+  #stage { position: relative; margin: 0 20px; border: 1px solid var(--border);
+           border-radius: 8px; background: var(--panel); overflow: hidden; }
+  .lane { position: relative; height: 30px; border-bottom: 1px solid var(--border); }
+  .lane:last-child { border-bottom: none; }
+  .lane-label { position: absolute; left: 6px; top: 0; line-height: 30px; font-size: 11px;
+                color: var(--dim); z-index: 2; pointer-events: none; }
+  .blk { position: absolute; top: 5px; height: 20px; border-radius: 3px; opacity: .9;
+         min-width: 2px; }
+  .blk.read { background: var(--c-read); } .blk.attempt { background: var(--c-attempt); }
+  .blk.conflict { background: var(--c-conflict); } .blk.backoff { background: var(--c-backoff); }
+  .blk.yield { background: var(--c-yield); } .blk.commit { background: var(--c-commit); }
+  .blk.give_up { background: var(--c-giveup); border: 1px solid var(--c-conflict); }
+  .ll-marker { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--c-livelock);
+               z-index: 3; box-shadow: 0 0 8px var(--c-livelock); }
+  #playhead { position: absolute; top: 0; bottom: 0; width: 1px; background: #fff; z-index: 4;
+              pointer-events: none; }
+  #legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 10px 20px; font-size: 12px;
+            color: var(--dim); }
+  .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px;
+        margin-right: 5px; vertical-align: -1px; }
+  #logwrap { margin: 0 20px 20px; border: 1px solid var(--border); border-radius: 8px;
+             background: var(--panel); max-height: 260px; overflow-y: auto; }
+  #log { width: 100%; border-collapse: collapse; font-size: 12px; font-family: monospace; }
+  #log td { padding: 3px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  #log tr.hl td { background: rgba(255,45,85,.12); color: var(--c-livelock); }
+  #log tr.done td { color: var(--c-commit); }
+  #log tr.bad td { color: var(--c-conflict); }
+  .tcol { color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>乐观锁并发更新回放</h1>
+  <div class="sub" id="meta"></div>
+</header>
+<div id="stats"></div>
+<div id="controls">
+  <button id="play">▶ 播放</button>
+  <select id="speed">
+    <option value="0.5">0.5×</option>
+    <option value="1" selected>1×</option>
+    <option value="2">2×</option>
+    <option value="4">4×</option>
+    <option value="8">8×</option>
+  </select>
+  <input id="scrub" type="range" min="0" max="1000" value="0">
+  <span id="clock">0.0 ms</span>
+</div>
+<div id="banner">⚠ 检测到活锁：写者持续冲突超出退避可解释范围，已授予优先级令牌强制让步</div>
+<div id="stage"><div id="playhead"></div></div>
+<div id="legend"></div>
+<div id="logwrap"><table id="log"></table></div>
+
+<script>
+const DATA = /*__DATA__*/null;
+const events = DATA.events, writers = DATA.writers, total = DATA.totalMs;
+
+const TYPE_LABEL = {read:'读取', attempt:'提交尝试', conflict:'冲突', backoff:'退避等待',
+  commit:'提交成功', livelock:'活锁检测', yield:'强制让步', give_up:'放弃'};
+const LEGEND = [['read','读取'],['attempt','提交尝试'],['conflict','冲突'],
+  ['backoff','退避'],['yield','让步'],['commit','提交成功'],['give_up','放弃']];
+
+// ---- stats ----
+const counts = {};
+for (const e of events) counts[e.type] = (counts[e.type]||0)+1;
+document.getElementById('meta').textContent =
+  `写者数 ${writers} · 每写者更新 ${DATA.updatesPerWriter} 次 · 退避 base=${DATA.backoffBase} cap=${DATA.backoffCap} ` +
+  `maxRetries=${DATA.maxRetries} jitter=${DATA.jitter} · 活锁阈值=${DATA.threshold} 次连续冲突`;
+document.getElementById('stats').innerHTML = [
+  ['最终值', DATA.finalValue], ['最终版本', DATA.finalVersion],
+  ['提交成功', counts.commit||0], ['冲突', counts.conflict||0],
+  ['放弃', counts.give_up||0], ['活锁触发', counts.livelock||0],
+  ['让步', counts.yield||0], ['总耗时', total.toFixed(1)+' ms'],
+].map(([k,v]) => `<div class="stat">${k}<b>${v}</b></div>`).join('');
+document.getElementById('legend').innerHTML = LEGEND.map(([t,l]) =>
+  `<span><span class="sw" style="background:var(--c-${t==='give_up'?'giveup':t})"></span>${l}</span>`).join('') +
+  `<span><span class="sw" style="background:var(--c-livelock)"></span>活锁触发时刻</span>`;
+
+// ---- lanes ----
+const stage = document.getElementById('stage');
+const LABEL_W = 60;
+const lanes = [];
+for (let w = 0; w < writers; w++) {
+  const lane = document.createElement('div');
+  lane.className = 'lane';
+  lane.innerHTML = `<span class="lane-label">W${w}</span>`;
+  stage.appendChild(lane);
+  lanes.push(lane);
+}
+// build per-writer state intervals: event i -> next event of same writer
+const byWriter = Array.from({length: writers}, () => []);
+events.forEach(e => byWriter[e.writer].push(e));
+const blocks = [];
+for (let w = 0; w < writers; w++) {
+  const evs = byWriter[w];
+  for (let i = 0; i < evs.length; i++) {
+    const start = evs[i].t, end = (i+1 < evs.length) ? evs[i+1].t : total;
+    const blk = document.createElement('div');
+    blk.className = 'blk ' + evs[i].type;
+    blk.dataset.start = start; blk.dataset.end = end;
+    blk.title = `W${w} ${TYPE_LABEL[evs[i].type]} v${evs[i].version} 尝试#${evs[i].attempt}` +
+                (evs[i].detail ? ` (${evs[i].detail})` : '');
+    lanes[w].appendChild(blk);
+    blocks.push(blk);
+  }
+}
+// livelock markers
+for (const e of events) if (e.type === 'livelock') {
+  const m = document.createElement('div');
+  m.className = 'll-marker'; m.dataset.t = e.t;
+  stage.appendChild(m);
+}
+
+function layout() {
+  const w = stage.clientWidth - LABEL_W;
+  for (const b of blocks) {
+    b.style.left = (LABEL_W + (+b.dataset.start)/total*w) + 'px';
+    b.style.width = Math.max(2, ((+b.dataset.end - +b.dataset.start)/total*w)) + 'px';
+  }
+  document.querySelectorAll('.ll-marker').forEach(m => {
+    m.style.left = (LABEL_W + (+m.dataset.t)/total*w) + 'px';
+  });
+}
+window.addEventListener('resize', layout);
+
+// ---- log ----
+const logTable = document.getElementById('log');
+const logRows = events.map(e => {
+  const tr = document.createElement('tr');
+  if (e.type === 'livelock') tr.className = 'hl';
+  if (e.type === 'commit') tr.className = 'done';
+  if (e.type === 'conflict' || e.type === 'give_up') tr.className = 'bad';
+  tr.innerHTML = `<td class="tcol">${e.t.toFixed(1)}ms</td><td>W${e.writer}</td>` +
+    `<td>${TYPE_LABEL[e.type]}</td><td>v${e.version}</td><td>#${e.attempt}</td>` +
+    `<td>${e.detail||''}</td>`;
+  tr.style.display = 'none';
+  logTable.appendChild(tr);
+  return tr;
+});
+
+// ---- playback ----
+const playBtn = document.getElementById('play'), scrub = document.getElementById('scrub'),
+      clock = document.getElementById('clock'), speedSel = document.getElementById('speed'),
+      playhead = document.getElementById('playhead'), banner = document.getElementById('banner'),
+      logwrap = document.getElementById('logwrap');
+let simT = 0, playing = false, lastWall = 0;
+
+function render() {
+  clock.textContent = simT.toFixed(1) + ' ms';
+  scrub.value = Math.round(simT/total*1000);
+  const w = stage.clientWidth - LABEL_W;
+  playhead.style.left = (LABEL_W + simT/total*w) + 'px';
+  let llOn = false, lastVisible = -1;
+  for (let i = 0; i < events.length; i++) {
+    const vis = events[i].t <= simT;
+    logRows[i].style.display = vis ? '' : 'none';
+    if (vis) {
+      lastVisible = i;
+      if (events[i].type === 'livelock') llOn = true;
+      if (events[i].type === 'commit' && i > 0) {
+        // banner stays until next commit after a livelock
+      }
+    }
+  }
+  // banner: on if a livelock fired and no commit has happened since
+  if (llOn) {
+    for (let i = 0; i < events.length && events[i].t <= simT; i++) {
+      if (events[i].type === 'livelock') llOn = true;
+      else if (events[i].type === 'commit') llOn = false;
+    }
+  }
+  banner.classList.toggle('on', llOn);
+  if (lastVisible >= 0) {
+    const r = logRows[lastVisible];
+    logwrap.scrollTop = r.offsetTop - logwrap.clientHeight + 40;
+  }
+}
+function tick(now) {
+  if (!playing) return;
+  const dt = (now - lastWall) * parseFloat(speedSel.value);
+  lastWall = now;
+  simT = Math.min(total, simT + dt);
+  render();
+  if (simT >= total) { playing = false; playBtn.textContent = '↺ 重播'; return; }
+  requestAnimationFrame(tick);
+}
+playBtn.onclick = () => {
+  if (simT >= total) simT = 0;
+  playing = !playing;
+  playBtn.textContent = playing ? '⏸ 暂停' : '▶ 播放';
+  if (playing) { lastWall = performance.now(); requestAnimationFrame(tick); }
+};
+scrub.oninput = () => { simT = scrub.value/1000*total; render(); };
+
+layout();
+render();
+</script>
+</body>
+</html>
